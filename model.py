@@ -18,6 +18,7 @@ from gsplat import (
     rasterize_gaussians_no_tiles,
     rasterize_gaussians_sum,
 )
+from gsplat.utils import bin_and_sort_gaussians, compute_cumulative_intersects
 from utils.flip import LDRFLIPLoss
 from utils.image_utils import (
     compute_image_gradients,
@@ -32,6 +33,7 @@ from utils.image_utils import (
 from utils.misc_utils import clean_dir, get_latest_ckpt_step, save_cfg, set_random_seed
 from utils.quantization_utils import ste_quantize
 from utils.saliency_utils import get_smap
+from utils.gaussian_io import GaussianBuffer, GaussianSplatHeader, save_gaussian_splats
 
 
 class GaussianSplatting2D(nn.Module):
@@ -312,6 +314,61 @@ class GaussianSplatting2D(nn.Module):
         self.worklog.info(f"Step: {self.start_step-1:d} | Time: {render_time:.6f} s")
         self.worklog.info(f"Rendering at resolution ({img_h:d}, {img_w:d}) completed")
         self.worklog.info("***********************************************")
+
+    def export_gaussians(self, path: str) -> None:
+        """Export the current gaussian parameterization to the portable Image-GS binary format."""
+        if self.disable_tiles:
+            raise RuntimeError("Gaussian export requires tile-based rendering to be enabled")
+
+        tile_bounds = self.tile_bounds
+        with torch.no_grad():
+            scale = self._get_scale()
+            xy = self.xy
+            rot = self.rot
+            feat = self.feat
+            if self.quantize:
+                xy = ste_quantize(xy, self.pos_bits)
+                scale = ste_quantize(scale, self.scale_bits)
+                rot = ste_quantize(rot, self.rot_bits)
+                feat = ste_quantize(feat, self.feat_bits)
+
+            projected = project_gaussians_2d_scale_rot(xy, scale, rot, self.img_h, self.img_w, tile_bounds)
+            centers, radii, conics, num_tiles_hit = projected
+
+            num_intersects, cum_tiles_hit = compute_cumulative_intersects(num_tiles_hit.cpu())
+            tile_count = tile_bounds[0] * tile_bounds[1]
+            if num_intersects > 0:
+                _, _, _, gaussian_ids_sorted, tile_bins = bin_and_sort_gaussians(
+                    centers.shape[0],
+                    num_intersects,
+                    centers.cpu(),
+                    radii.cpu(),
+                    cum_tiles_hit,
+                    tile_bounds,
+                )
+            else:
+                gaussian_ids_sorted = torch.zeros(0, dtype=torch.int32)
+                tile_bins = torch.zeros(tile_count, 2, dtype=torch.int32)
+
+        header = GaussianSplatHeader(
+            image_width=self.img_w,
+            image_height=self.img_h,
+            tile_width=self.block_w,
+            tile_height=self.block_h,
+            channels=self.feat_dim,
+            gaussian_count=int(centers.shape[0]),
+            intersection_count=int(num_intersects),
+            topk=self.topk if not self.disable_topk_norm else 0,
+        )
+        buffers = GaussianBuffer(
+            centers=centers.cpu().numpy(),
+            conics=conics.cpu().numpy(),
+            colors=feat.cpu().numpy(),
+            gaussian_ids_sorted=gaussian_ids_sorted.cpu().numpy(),
+            tile_bins=tile_bins.cpu().numpy(),
+        )
+        save_gaussian_splats(path, header, buffers)
+        self.worklog.info(f"Exported {header.gaussian_count:d} gaussians to '{path}'")
 
     def benchmark_render_time(self, num_reps, render_height=None):
         img_h, img_w = self.img_h, self.img_w
