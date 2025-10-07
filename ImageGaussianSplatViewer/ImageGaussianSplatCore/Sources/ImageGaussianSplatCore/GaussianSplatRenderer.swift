@@ -32,13 +32,14 @@ struct ComputeUniforms {
     var tileCountX: UInt32
     var tileCountY: UInt32
     var channels: UInt32
-    var padding: UInt32 = 0
+    var topK: UInt32
 }
 
 public final class GaussianSplatRenderer: NSObject, MTKViewDelegate {
     public let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private let computePipeline: MTLComputePipelineState
+    private let computePipelineTopK: MTLComputePipelineState
     private let renderPipeline: MTLRenderPipelineState
     private let samplerState: MTLSamplerState
 
@@ -68,6 +69,7 @@ public final class GaussianSplatRenderer: NSObject, MTKViewDelegate {
         do {
             let library = try device.makeDefaultLibrary(bundle: .module)
             guard let computeFunction = library.makeFunction(name: "splatGaussians"),
+                  let computeFunctionTopK = library.makeFunction(name: "splatGaussiansTopK"),
                   let vertexFunction = library.makeFunction(name: "quadVertex"),
                   let fragmentFunction = library.makeFunction(name: "texturedFragment")
             else {
@@ -75,6 +77,7 @@ public final class GaussianSplatRenderer: NSObject, MTKViewDelegate {
             }
 
             self.computePipeline = try device.makeComputePipelineState(function: computeFunction)
+            self.computePipelineTopK = try device.makeComputePipelineState(function: computeFunctionTopK)
 
             let pipelineDescriptor = MTLRenderPipelineDescriptor()
             pipelineDescriptor.vertexFunction = vertexFunction
@@ -216,12 +219,16 @@ public final class GaussianSplatRenderer: NSObject, MTKViewDelegate {
             tileHeight: UInt32(scene.header.tileHeight),
             tileCountX: UInt32(scene.header.tileCountX),
             tileCountY: UInt32(scene.header.tileCountY),
-            channels: UInt32(scene.header.channels)
+            channels: UInt32(scene.header.channels),
+            topK: UInt32(scene.header.topK)
         )
         memcpy(uniformBuffer.contents(), &uniforms, MemoryLayout<ComputeUniforms>.stride)
 
+        // Choose the appropriate pipeline based on topK setting
+        let pipeline = scene.header.topK > 0 ? computePipelineTopK : computePipeline
+        
         computeEncoder.label = "GaussianComputePass"
-        computeEncoder.setComputePipelineState(computePipeline)
+        computeEncoder.setComputePipelineState(pipeline)
         computeEncoder.setBuffer(gaussianBuffer, offset: 0, index: 0)
         computeEncoder.setBuffer(colorBuffer, offset: 0, index: 1)
         computeEncoder.setBuffer(gaussianIdBuffer, offset: 0, index: 2)
